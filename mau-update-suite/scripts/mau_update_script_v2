@@ -278,5 +278,3 @@ exit 0
 *   Pipe `--list` results into **Jamf Extension Attributes** to report update status per device.
 
 ***
-
-**Quick check**: Do you want me to tailor the default app set to only **Outlook, Word, Excel, PowerPoint, OneDrive, Defender, Company Portal** (and exclude Teams/Edge), and wrap this in a Jamf Extension Attribute + two policies (list vs. install) for your fleet?
