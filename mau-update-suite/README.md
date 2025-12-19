@@ -46,7 +46,7 @@ This repository contains **three Bash scripts** designed for macOS fleets to man
 - SwiftDialog prompt with **Update Now / Defer** buttons, **timer**, and **ESC to defer**.
 - Configurable `--max-deferrals` and `--timer`.
 - Graceful quits via AppleScript, run in the console user’s context.
-- Summaries at `/Library/Logs/BHG/mau_update_summary.txt` and local state at `/Library/Application Support/BHG/MAU/state.txt`.
+- Summaries at `/Library/Logs/mau_update_summary.txt` and local state at `/Library/Application Support/MAU/state.txt`.
 
 **Jamf usage:**
 ```
