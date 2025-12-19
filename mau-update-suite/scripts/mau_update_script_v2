@@ -1,0 +1,282 @@
+***
+
+## What this script does
+
+*   Detects the **`msupdate`** binary (works with both legacy and current MAU install paths).
+*   Optionally **opens the MAU GUI** for the user (`open -a "Microsoft AutoUpdate"`).
+*   Runs a **scan**, **lists** available updates, and can **install** updates for:
+    *   Word, Excel, PowerPoint, Outlook, OneNote, OneDrive, Company Portal (Intune), Defender, Teams (classic), Edge (note: Edge has its own updater, but `msupdate` can list some channels on certain builds), and the MAU tool itself.
+*   Logs to `/var/log/mau_update.log`.
+*   Designed to run **as root via Jamf** or locally with sudo.
+*   Safe if MAU isn’t installed—gives clear exit codes.
+
+***
+
+## Usage examples
+
+*   **List** available updates only:
+    ```bash
+    sudo ./mau_update.sh --list
+    ```
+
+*   **Install all** supported Microsoft apps:
+    ```bash
+    sudo ./mau_update.sh --install --all
+    ```
+
+*   **Install specific apps** (comma-separated IDs):
+    ```bash
+    sudo ./mau_update.sh --install --apps com.microsoft.Word,com.microsoft.Excel,com.microsoft.Outlook
+    ```
+
+*   **Open GUI** + **list** in CLI:
+    ```bash
+    ./mau_update.sh --open --list
+    ```
+
+***
+
+## The script
+
+```bash
+#!/bin/bash
+#
+# mau_update.sh
+# Purpose: Open Microsoft AutoUpdate GUI and run msupdate to scan/list/install updates on macOS.
+#
+# Exit codes:
+#  0 = success
+#  1 = msupdate not found
+#  2 = invalid arguments
+#  3 = install operation failed
+#  4 = list/scan operation failed
+#
+# Log file:
+LOG_FILE="/var/log/mau_update.log"
+
+# Default app IDs (extend as needed)
+DEFAULT_APPS=(
+  "com.microsoft.autoupdate"        # Microsoft AutoUpdate itself
+  "com.microsoft.Word"
+  "com.microsoft.Excel"
+  "com.microsoft.Powerpoint"
+  "com.microsoft.Outlook"
+  "com.microsoft.onenote.mac"
+  "com.microsoft.OneDrive"
+  "com.microsoft.CompanyPortal"
+  "com.microsoft.wdav"              # Microsoft Defender for Endpoint
+  "com.microsoft.teams"             # Teams classic; new Teams may update via App Store/MSIX
+  "com.microsoft.Edge"              # Edge typically uses its own updater
+)
+
+# ------- Utilities -------
+timestamp() { date "+%Y-%m-%d %H:%M:%S"; }
+log() { echo "[$(timestamp)] $*" | tee -a "$LOG_FILE"; }
+
+# Resolve msupdate path (supporting both modern and legacy)
+resolve_msupdate() {
+  local candidates=(
+    "/Applications/Microsoft AutoUpdate.app/Contents/MacOS/msupdate"
+    "/Library/Application Support/Microsoft/MAU2.0/Microsoft AutoUpdate.app/Contents/MacOS/msupdate"
+  )
+  for p in "${candidates[@]}"; do
+    if [ -x "$p" ]; then
+      echo "$p"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Open MAU GUI (optional)
+open_mau_gui() {
+  if command -v open >/dev/null 2>&1; then
+    open -a "Microsoft AutoUpdate" 2>/dev/null && log "Opened Microsoft AutoUpdate GUI." || log "GUI open failed or app not present."
+  else
+    log "macOS 'open' command not found."
+  fi
+}
+
+# Parse comma-separated app list into array
+parse_apps_csv() {
+  local csv="$1"
+  IFS=',' read -r -a parsed <<< "$csv"
+  echo "${parsed[@]}"
+}
+
+# ------- Argument parsing -------
+SHOW_HELP=false
+DO_OPEN=false
+DO_LIST=false
+DO_INSTALL=false
+USE_ALL=false
+CUSTOM_APPS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --help|-h) SHOW_HELP=true; shift ;;
+    --open) DO_OPEN=true; shift ;;
+    --list) DO_LIST=true; shift ;;
+    --scan) DO_LIST=true; shift ;;       # alias, msupdate list triggers a scan internally
+    --install) DO_INSTALL=true; shift ;;
+    --all) USE_ALL=true; shift ;;
+    --apps)
+      if [[ -n "$2" ]]; then
+        CUSTOM_APPS=($(parse_apps_csv "$2"))
+        shift 2
+      else
+        log "ERROR: --apps requires a comma-separated list of app IDs."
+        exit 2
+      fi
+      ;;
+    *)
+      log "WARN: Unrecognized argument: $1"
+      shift
+      ;;
+  esac
+done
+
+if $SHOW_HELP; then
+  cat <<'EOF'
+Microsoft AutoUpdate helper
+
+Options:
+  --open         Open the Microsoft AutoUpdate GUI (user-facing)
+  --list|--scan  Scan and list available updates via msupdate
+  --install      Install updates for selected apps
+  --all          Use the default built-in set of Microsoft app IDs
+  --apps <csv>   Comma-separated app IDs (overrides or supplements defaults)
+  -h|--help      Show this help
+
+Examples:
+  sudo ./mau_update.sh --list
+  sudo ./mau_update.sh --install --all
+  sudo ./mau_update.sh --install --apps com.microsoft.Word,com.microsoft.Outlook
+EOF
+  exit 0
+fi
+
+# Ensure at least one action
+if ! $DO_OPEN && ! $DO_LIST && ! $DO_INSTALL; then
+  log "INFO: No action specified. Defaulting to --list."
+  DO_LIST=true
+fi
+
+# Resolve msupdate path
+MSUPDATE_BIN="$(resolve_msupdate)"
+if [[ -z "$MSUPDATE_BIN" ]]; then
+  log "ERROR: 'msupdate' not found. Ensure Microsoft AutoUpdate is installed."
+  exit 1
+fi
+log "Using msupdate at: $MSUPDATE_BIN"
+
+# Compute target app list
+TARGET_APPS=()
+if $USE_ALL; then
+  TARGET_APPS=("${DEFAULT_APPS[@]}")
+fi
+if [[ ${#CUSTOM_APPS[@]} -gt 0 ]]; then
+  # Merge and de-duplicate
+  TARGET_APPS=($(printf "%s\n" "${TARGET_APPS[@]}" "${CUSTOM_APPS[@]}" | awk '!seen[$0]++'))
+fi
+# If installing and no apps specified, default to ALL
+if $DO_INSTALL && [[ ${#TARGET_APPS[@]} -eq 0 ]]; then
+  log "INFO: --install requested without --apps/--all. Using default app set."
+  TARGET_APPS=("${DEFAULT_APPS[@]}")
+fi
+
+# ------- Actions -------
+# 1) Open GUI (non-blocking)
+if $DO_OPEN; then
+  open_mau_gui
+fi
+
+# 2) List available updates
+if $DO_LIST; then
+  log "Running 'msupdate --list' (this triggers a scan)..."
+  if "$MSUPDATE_BIN" --list | tee -a "$LOG_FILE"; then
+    log "List/scan completed."
+  else
+    log "ERROR: msupdate --list failed."
+    # Continue if install is requested; otherwise exit
+    if ! $DO_INSTALL; then
+      exit 4
+    fi
+  fi
+fi
+
+# 3) Install updates for selected apps
+if $DO_INSTALL; then
+  if [[ ${#TARGET_APPS[@]} -eq 0 ]]; then
+    log "ERROR: No app IDs provided and defaults unavailable."
+    exit 2
+  fi
+
+  # Build comma-separated string for msupdate
+  APP_CSV=$(IFS=','; echo "${TARGET_APPS[*]}")
+
+  log "Attempting install for apps: ${APP_CSV}"
+  # --install with --apps will try each ID; use --wait to block until complete
+  if "$MSUPDATE_BIN" --install --apps "$APP_CSV" --wait | tee -a "$LOG_FILE"; then
+    log "Install completed successfully for requested apps."
+  else
+    log "ERROR: Install operation encountered errors."
+    # Try a second pass with --force for stubborn cases (optional)
+    log "Retrying with --force for stubborn updates..."
+    if "$MSUPDATE_BIN" --install --apps "$APP_CSV" --wait --force | tee -a "$LOG_FILE"; then
+      log "Second attempt completed."
+    else
+      log "ERROR: Second attempt failed."
+      exit 3
+    fi
+  fi
+fi
+
+log "mau_update.sh completed."
+exit 0
+```
+
+***
+
+## Notes & tips for deployment (Jamf Pro)
+
+*   **Run as root** via a Jamf policy (Files and Processes → “Execute Command”) or attach the script to a policy payload.
+*   Consider **scoping** to smart groups (e.g., macOS versions, app presence, MAU version).
+*   If users should watch progress or be able to defer, include `--open` so MAU GUI is visible; otherwise omit for silent CLI installs.
+*   For **Defender** and **Company Portal**, make sure they’re installed from your standard sources before running updates.
+*   **New Teams** may use a different packaging/update mechanism; if it doesn’t respond to `msupdate`, remove its ID from the list.
+*   **Logging**: Review `/var/log/mau_update.log` for results and troubleshooting.
+
+***
+
+## Common Microsoft app IDs (for reference)
+
+*   `com.microsoft.autoupdate` — Microsoft AutoUpdate
+*   `com.microsoft.Word` — Word
+*   `com.microsoft.Excel` — Excel
+*   `com.microsoft.Powerpoint` — PowerPoint
+*   `com.microsoft.Outlook` — Outlook
+*   `com.microsoft.onenote.mac` — OneNote (Mac)
+*   `com.microsoft.OneDrive` — OneDrive
+*   `com.microsoft.CompanyPortal` — Intune Company Portal
+*   `com.microsoft.wdav` — Microsoft Defender for Endpoint
+*   `com.microsoft.teams` — Teams (classic)
+*   `com.microsoft.Edge` — Microsoft Edge (support varies)
+
+> You can list everything MAU sees on a machine with:
+>
+> ```bash
+> "$MSUPDATE_BIN" --list
+> ```
+
+***
+
+### Optional enhancements
+
+*   Add **SwiftDialog** or native alerts around installs to warn about app restarts.
+*   Detect logged-in user and conditionally open GUI only if a GUI session exists.
+*   Pipe `--list` results into **Jamf Extension Attributes** to report update status per device.
+
+***
+
+**Quick check**: Do you want me to tailor the default app set to only **Outlook, Word, Excel, PowerPoint, OneDrive, Defender, Company Portal** (and exclude Teams/Edge), and wrap this in a Jamf Extension Attribute + two policies (list vs. install) for your fleet?
