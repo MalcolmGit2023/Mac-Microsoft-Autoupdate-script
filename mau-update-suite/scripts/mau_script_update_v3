@@ -361,4 +361,4 @@ o	Legacy path: /usr/local/bin/swiftDialog
 Optional refinements
 •	Add a timeout: If an app refuses to quit after multiple attempts, offer a final prompt to force-close (not recommended; risk of data loss).
 •	Display countdown and deferral options using SwiftDialog’s --timer and --quitkey to allow ESC to defer.
-•	Write human-readable summaries to /Library/Logs/BHG/mau_update_summary.txt and collect with Jamf EA.
+•	Write human-readable summaries to /Library/Logs/mau_update_summary.txt and collect with Jamf EA.
