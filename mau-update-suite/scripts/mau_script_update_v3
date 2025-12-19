@@ -1,0 +1,364 @@
+This script that detects open Microsoft apps and prompts the user with SwiftDialog to save work and close apps before proceeding. If SwiftDialog isn’t present, it falls back to Jamf Helper. It will:
+•	Enumerate common Microsoft processes (Word, Excel, PowerPoint, Outlook, OneNote, OneDrive, Teams classic, Defender, Company Portal, Edge).
+•	Show a blocking SwiftDialog prompt with the list of open apps and offer:
+o	“Close Apps Now” → attempts graceful quit via AppleScript, then re-checks.
+o	“Remind Me Later” → aborts install (safe exit).
+•	If the user closes the apps, the script proceeds to msupdate --install.
+•	All actions are logged to /var/log/mau_update.log.
+Prereqs: SwiftDialog installed at /usr/local/bin/dialog (new path) or /usr/local/bin/swiftDialog (older). If neither is found, Jamf Helper is used.
+ 
+Updated script with SwiftDialog checks
+Save as mau_update.sh and deploy via Jamf policy (run as root).\ Differences vs. previous version are marked with ### NEW comments.
+#!/bin/bash
+#
+# mauupdate.sh
+# Purpose: Open Microsoft AutoUpdate GUI and run msupdate to scan/list/install updates on macOS.
+#          NEW: Detect open Microsoft apps and prompt user via SwiftDialog/Jamf Helper to close them.
+# Author: Malcolm Mitchum
+# Date: 2025-12-19
+#
+# Exit codes:
+#  0 = success
+#  1 = msupdate not found
+#  2 = invalid arguments
+#  3 = install operation failed
+#  4 = list/scan operation failed
+#  5 = user deferred (apps open, chose Remind Me Later)
+#
+LOGFILE="/var/log/mauupdate.log"
+
+# Default app IDs (extend as needed)
+DEFAULTAPPS=(
+  "com.microsoft.autoupdate"
+  "com.microsoft.Word"
+  "com.microsoft.Excel"
+  "com.microsoft.Powerpoint"
+  "com.microsoft.Outlook"
+  "com.microsoft.onenote.mac"
+  "com.microsoft.OneDrive"
+  "com.microsoft.CompanyPortal"
+  "com.microsoft.wdav"
+  "com.microsoft.teams"
+  "com.microsoft.Edge"
+)
+
+### NEW: Process names to look for (exact binaries as they appear in 'ps')
+MSPROCESSES=(
+  "Microsoft Word"
+  "Microsoft Excel"
+  "Microsoft PowerPoint"
+  "Microsoft Outlook"
+  "OneNote"
+  "OneDrive"
+  "Microsoft Teams"
+  "Microsoft Defender"
+  "Company Portal"
+  "Microsoft Edge"
+)
+
+# SwiftDialog paths (newer and older)
+DIALOGBIN=""
+JAMFHELPER="/Library/Application Support/JAMF/bin/jamfHelper.app/Contents/MacOS/jamfHelper"
+
+timestamp() { date "+%Y-%m-%d %H:%M:%S"; }
+log()       { echo "[$(timestamp)] $" | tee -a "$LOGFILE"; }
+
+resolvemsupdate() {
+  local candidates=(
+    "/Applications/Microsoft AutoUpdate.app/Contents/MacOS/msupdate"
+    "/Library/Application Support/Microsoft/MAU2.0/Microsoft AutoUpdate.app/Contents/MacOS/msupdate"
+  )
+  for p in "${candidates[@]}"; do
+    if [ -x "$p" ]; then
+      echo "$p"; return 0
+    fi
+  done
+  return 1
+}
+
+openmaugui() {
+  if command -v open >/dev/null 2>&1; then
+    open -a "Microsoft AutoUpdate" 2>/dev/null && log "Opened MAU GUI." || log "GUI open failed or app absent."
+  else
+    log "'open' command missing."
+  fi
+}
+
+parseappscsv() {
+  local csv="$1"
+  IFS=',' read -r -a parsed <<< "$csv"
+  echo "${parsed[@]}"
+}
+
+### NEW: Detect SwiftDialog (preferred) or fallback to Jamf Helper
+detectdialog() {
+  local candidates=(
+    "/usr/local/bin/dialog"        # SwiftDialog 2.x+
+    "/usr/local/bin/swiftDialog"   # older name
+  )
+  for d in "${candidates[@]}"; do
+    if [ -x "$d" ]; then DIALOGBIN="$d"; return 0; fi
+  done
+  return 1
+}
+
+### NEW: Get list of running Microsoft processes
+getrunningmsapps() {
+  local running=()
+  for proc in "${MSPROCESSES[@]}"; do
+    # Use pgrep -fl to match full command line, case-sensitive exact process names
+    if pgrep -fl "$proc" >/dev/null 2>&1; then
+      running+=("$proc")
+    fi
+  done
+  echo "${running[@]}"
+}
+
+### NEW: Present SwiftDialog prompt to close apps
+promptcloseappsswiftdialog() {
+  local apps=("$@")
+  local listtext=""
+  for a in "${apps[@]}"; do
+    listtext+="- ${a}\n"
+  done
+
+  # Compose dialog message
+  local title="Microsoft Updates Ready"
+  local message="The following Microsoft apps are open and need to be closed to install updates:\n\n${listtext}\nPlease save your work.\nSelect “Close Apps Now” to continue, or “Remind Me Later” to postpone."
+
+  # SwiftDialog arguments (list-style, two buttons)
+  "$DIALOGBIN" \
+    --title "$title" \
+    --message "$message" \
+    --icon "/Applications/Microsoft AutoUpdate.app" \
+    --button1text "Close Apps Now" \
+    --button2text "Remind Me Later" \
+    --width 560 \
+    --height 300
+
+  # SwiftDialog returns exit codes via file or stdout depending on version.
+  # Simplest approach: read last line containing "exit code" if supported, otherwise assume button2 when non-zero.
+  local rc=$?
+  return $rc
+}
+
+### NEW: Jamf Helper prompt fallback
+promptcloseappsjamfhelper() {
+  local apps=("$@")
+  local listtext=""
+  for a in "${apps[@]}"; do listtext+="- ${a}\n"; done
+
+  "$JAMFHELPER" \
+    -windowType utility \
+    -title "Microsoft Updates Ready" \
+    -description "The following Microsoft apps are open and must be closed to apply updates:\n\n${listtext}\n\nPlease save your work.\n" \
+    -button1 "Close Apps Now" \
+    -button2 "Remind Me Later" \
+    -defaultButton 1 \
+    -icon "/Applications/Microsoft AutoUpdate.app/Contents/Resources/AppIcon.icns"
+
+  local rc=$?
+  # jamfHelper returns 0 for button1, 2 for button2
+  if [ "$rc" -eq 0 ]; then return 0; else return 2; fi
+}
+
+### NEW: Gracefully quit listed apps using AppleScript
+quitappsgracefully() {
+  local apps=("$@")
+  for a in "${apps[@]}"; do
+    log "Attempting graceful quit: $a"
+    /usr/bin/osascript <<OSA
+try
+  tell application "$a" to quit
+end try
+OSA
+    sleep 2
+  done
+}
+
+### NEW: Loop until apps are closed or user defers
+ensureappsclosedordefer() {
+  local attempt=1
+  local maxattempts=3
+
+  while [ "$attempt" -le "$maxattempts" ]; do
+    local running=($(getrunningmsapps))
+    if [ ${#running[@]} -eq 0 ]; then
+      log "No Microsoft apps are running. Proceeding with install."
+      return 0
+    fi
+
+    log "Detected running Microsoft apps: ${running[]}"
+
+    # Prompt user
+    if detectdialog; then
+      promptcloseappsswiftdialog "${running[@]}"
+      local choice=$?
+      # SwiftDialog: 0 typically means button1, non-zero button2/close
+      if [ "$choice" -eq 0 ]; then
+        quitappsgracefully "${running[@]}"
+      else
+        log "User chose 'Remind Me Later' via SwiftDialog. Aborting install."
+        return 5
+      fi
+    else
+      log "SwiftDialog not found; using Jamf Helper fallback."
+      promptcloseappsjamfhelper "${running[@]}"
+      local choice=$?
+      if [ "$choice" -eq 0 ]; then
+        quitappsgracefully "${running[@]}"
+      else
+        log "User chose 'Remind Me Later' via Jamf Helper. Aborting install."
+        return 5
+      fi
+    fi
+
+    # Re-check after quit attempt
+    local remaining=($(getrunningmsapps))
+    if [ ${#remaining[@]} -eq 0 ]; then
+      log "All Microsoft apps closed. Continuing."
+      return 0
+    else
+      log "Some apps still open after quit attempt: ${remaining[]}"
+      attempt=$((attempt+1))
+      # Short wait before next prompt
+      sleep 2
+    fi
+  done
+
+  # Final check
+  local final=($(getrunningmsapps))
+  if [ ${#final[@]} -eq 0 ]; then
+    log "All apps closed after retries."
+    return 0
+  else
+    log "Apps remain open after $maxattempts attempts. Aborting install."
+    return 5
+  fi
+}
+
+# ------- Argument parsing -------
+SHOWHELP=false
+DOOPEN=false
+DOLIST=false
+DOINSTALL=false
+USEALL=false
+CUSTOMAPPS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --help|-h) SHOWHELP=true; shift ;;
+    --open) DOOPEN=true; shift ;;
+    --list|--scan) DOLIST=true; shift ;;
+    --install) DOINSTALL=true; shift ;;
+    --all) USEALL=true; shift ;;
+    --apps)
+      if [[ -n "$2" ]]; then
+        CUSTOMAPPS=($(parseappscsv "$2")); shift 2
+      else
+        log "ERROR: --apps requires a comma-separated list of app IDs."; exit 2
+      fi
+      ;;
+    ) log "WARN: Unrecognized argument: $1"; shift ;;
+  esac
+done
+
+if $SHOWHELP; then
+  cat <<'EOF'
+Microsoft AutoUpdate helper
+
+Options:
+  --open         Open the Microsoft AutoUpdate GUI (user-facing)
+  --list|--scan  Scan and list available updates via msupdate
+  --install      Install updates for selected apps (with user prompt to close apps)
+  --all          Use the default built-in set of Microsoft app IDs
+  --apps <csv>   Comma-separated app IDs (overrides or supplements defaults)
+  -h|--help      Show this help
+EOF
+  exit 0
+fi
+
+if ! $DOOPEN && ! $DOLIST && ! $DOINSTALL; then
+  log "INFO: No action specified. Defaulting to --list."
+  DOLIST=true
+fi
+
+MSUPDATEBIN="$(resolvemsupdate)"
+if [[ -z "$MSUPDATEBIN" ]]; then
+  log "ERROR: 'msupdate' not found. Ensure Microsoft AutoUpdate is installed."
+  exit 1
+fi
+log "Using msupdate at: $MSUPDATEBIN"
+
+TARGETAPPS=()
+if $USEALL; then TARGETAPPS=("${DEFAULTAPPS[@]}"); fi
+if [[ ${#CUSTOMAPPS[@]} -gt 0 ]]; then
+  TARGETAPPS=($(printf "%s\n" "${TARGETAPPS[@]}" "${CUSTOMAPPS[@]}" | awk '!seen[$0]++'))
+fi
+if $DOINSTALL && [[ ${#TARGETAPPS[@]} -eq 0 ]]; then
+  log "INFO: --install without --apps/--all. Using default app set."
+  TARGETAPPS=("${DEFAULTAPPS[@]}")
+fi
+
+# ------- Actions -------
+if $DOOPEN; then openmaugui; fi
+
+if $DOLIST; then
+  log "Running 'msupdate --list'…"
+  if "$MSUPDATEBIN" --list | tee -a "$LOGFILE"; then
+    log "List/scan completed."
+  else
+    log "ERROR: msupdate --list failed."
+    if ! $DOINSTALL; then exit 4; fi
+  fi
+fi
+
+if $DOINSTALL; then
+  # NEW: ensure apps are closed (or defer)
+  ensureappsclosedordefer
+  ensurerc=$?
+  if [ "$ensurerc" -eq 5 ]; then
+    # user deferred
+    exit 5
+  elif [ "$ensurerc" -ne 0 ]; then
+    log "ERROR: Pre-install app-close check failed (rc=$ensurerc)."; exit 3
+  fi
+
+  APPCSV=$(IFS=','; echo "${TARGETAPPS[*]}")
+  log "Installing updates for: ${APPCSV}"
+
+  if "$MSUPDATEBIN" --install --apps "$APPCSV" --wait | tee -a "$LOGFILE"; then
+    log "Install completed successfully."
+  else
+    log "ERROR: Install encountered errors. Retrying with --force…"
+    if "$MSUPDATEBIN" --install --apps "$APPCSV" --wait --force | tee -a "$LOGFILE"; then
+      log "Second attempt completed."
+    else
+      log "ERROR: Second attempt failed."
+      exit 3
+    fi
+  fi
+fi
+
+log "mau_update.sh completed."
+exit 0
+ 
+How it behaves (user experience)
+1.	Detects open Microsoft apps.\ If none are running, proceeds silently.
+2.	Shows SwiftDialog prompt (or Jamf Helper fallback) listing the open apps with two buttons:
+o	Close Apps Now → Script triggers graceful quits via AppleScript, re-checks, and continues if all are closed.
+o	Remind Me Later → Script aborts the install safely (exit code 5), so your Jamf policy can mark as deferred.
+3.	Runs msupdate --install --wait to apply updates when apps are closed.
+ 
+Jamf Pro deployment tips
+•	Policy 1 (Assessment/List): Run ./mau_update.sh --list scoped to all Macs to record what’s pending in logs or EA.
+•	Policy 2 (Install): Run ./mau_update.sh --install --all. Scope to smart groups (e.g., MAU present, macOS version, user logged in).
+•	Deferral tracking: Treat exit code 5 as a deferral and write to an Extension Attribute or a Jamf “deferred” EA file to count attempts.
+•	SwiftDialog: Ensure SwiftDialog is deployed prior to running this script (can be a separate policy).
+o	New binary path: /usr/local/bin/dialog
+o	Legacy path: /usr/local/bin/swiftDialog
+ 
+Optional refinements
+•	Add a timeout: If an app refuses to quit after multiple attempts, offer a final prompt to force-close (not recommended; risk of data loss).
+•	Display countdown and deferral options using SwiftDialog’s --timer and --quitkey to allow ESC to defer.
+•	Write human-readable summaries to /Library/Logs/BHG/mau_update_summary.txt and collect with Jamf EA.
